@@ -274,6 +274,7 @@ function NetBirdPlugin:applyConnectMode(mode)
     NetBirdConnect.socks_enabled = mode == "netstack"
     NetBirdConnect.hostnames = mode == "tun" and self:getHostnames() or {}
     NetBirdConnect.dns_host = nil
+    NetBirdConnect.is_running = NetBirdPlugin.isRunning
     NetBirdConnect.find_dns_host = function()
         local status = self:getStatus()
         return status and NetBirdConnect.dnsAddressFor(status.netbirdIp)

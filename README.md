@@ -84,8 +84,9 @@ This depends on your device's mode, which setup tells you.
 KOReader then asks NetBird's DNS for those names only, and keeps the real name for your
 reverse proxy and its certificate. Every other name uses the device's normal DNS. If
 NetBird can't resolve a listed name while connected, the connection fails rather than
-going out over the regular network. A redirect to another name needs that name listed
-too.
+going out over the regular network. With NetBird turned off, those names use the
+device's normal DNS again, so at home, where you can reach your server directly, just
+turn NetBird off. A redirect to another name needs that name listed too.
 
 If your server is a NetBird peer itself, you can use its NetBird IP instead, as below.
 

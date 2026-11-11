@@ -353,6 +353,14 @@ check("peer reachable on the new identity", body and body:match("hello from the 
 if MODE == "tun" then
     plugin:toggleConnection()
     check("the hook lets go of names once disconnected", next(Connect.hostnames) == nil)
+    -- Even with names left listed, a stopped daemon sends them the regular way.
+    Connect.hostnames = { ["opds.internal"] = true }
+    local sock = require("socket").tcp()
+    local _ok, err = sock:connect("opds.internal", 80)
+    sock:close()
+    check("a listed name skips NetBird while it is off",
+        not tostring(err):match("NetBird could not resolve"), err)
+    Connect.hostnames = {}
     check("system DNS is intact after disconnecting", resolvConf() == resolv_before)
     plugin:toggleConnection()
     pump(90)
