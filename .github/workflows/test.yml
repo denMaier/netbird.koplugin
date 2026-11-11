@@ -1,9 +1,8 @@
 # Runs test/run.sh on a GitHub arm64 runner, so pull requests don't need a local OrbStack run.
+# Not on pushes to main: those are merged pull requests, already tested.
 name: test
 on:
   pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
