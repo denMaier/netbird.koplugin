@@ -9,19 +9,24 @@
     {
       "id": "netbird",
       "name": "NetBird VPN",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "description": "Joins your e-reader to your NetBird network, so OPDS and sync can reach self-hosted services. Downloads the official NetBird client after asking. Only tested on a Kindle Paperwhite 12th gen so far, testers welcome.",
       "author": "denMaier",
       "category": "utility",
-      "platforms": ["koreader"],
-      "incompatible_platforms": ["android", "host"],
+      "platforms": [
+        "koreader"
+      ],
+      "incompatible_platforms": [
+        "android",
+        "host"
+      ],
       "dependencies": [],
-      "published_at": "2026-11-02T16:07:56Z",
+      "published_at": "2026-11-11T11:06:31Z",
       "source": "https://github.com/denMaier/netbird.koplugin",
       "source_type": "release",
-      "source_asset": "netbird.koplugin-v0.1.1.zip",
+      "source_asset": "netbird.koplugin-v0.1.2.zip",
       "versions_url": "versions.json",
-      "size": "21253"
+      "size": "23640"
     }
   ]
 }
