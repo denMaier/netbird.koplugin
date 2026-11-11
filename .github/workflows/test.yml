@@ -23,10 +23,13 @@ jobs:
     timeout-minutes: 20
     env:
       KOREADER: v2026.07.1
+      PROOT: v5.4.1
+      PROOT_SHA256: 19f44283f5c0e73091c60195f5fcd4f4c1165505e44410d434e2ab1b677c1a09
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -yq xvfb x11-xkb-utils xkb-data proot
-      # run.sh expects an extracted AppImage and a sysroot; the runner's own tools stand in for the sysroot.
+      # run.sh expects an extracted AppImage and a sysroot. The runner image already has
+      # Xvfb and xkb, and proot comes as a static build from its GitHub release, so the
+      # job doesn't depend on Ubuntu's mirrors, which have failed to resolve on runners.
       - name: Prepare the emulator
         run: |
           dev=$RUNNER_TEMP/koreader-dev
@@ -35,8 +38,12 @@ jobs:
           curl -fsSLo koreader.AppImage "https://github.com/koreader/koreader/releases/download/$KOREADER/koreader-$KOREADER-x86_64.AppImage"
           chmod +x koreader.AppImage
           ./koreader.AppImage --appimage-extract >/dev/null
-          ln -s /usr/bin/Xvfb /usr/bin/proot /usr/bin/xkbcomp sysroot/usr/bin/
+          curl -fsSLo sysroot/usr/bin/proot "https://github.com/proot-me/proot/releases/download/$PROOT/proot"
+          echo "$PROOT_SHA256  sysroot/usr/bin/proot" | sha256sum -c -
+          chmod +x sysroot/usr/bin/proot
+          ln -s /usr/bin/Xvfb /usr/bin/xkbcomp sysroot/usr/bin/
           ln -s /usr/share/X11/xkb sysroot/usr/share/X11/xkb
+          test -x sysroot/usr/bin/Xvfb && test -x sysroot/usr/bin/xkbcomp && test -d sysroot/usr/share/X11/xkb/rules
       - run: test/emulator/run.sh "$RUNNER_TEMP/koreader-dev"
       - if: always()
         uses: actions/upload-artifact@v4

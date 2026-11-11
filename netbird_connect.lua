@@ -21,6 +21,7 @@ local NetBirdConnect = {
     dns_timeout = 5,
     dns_host = nil, -- found once through find_dns_host, then kept
     find_dns_host = nil, -- set by main.lua; returns NetBird's DNS address, or nil
+    is_running = function() return false end, -- set by main.lua; whether a daemon is up
 }
 
 --- NetBird hands out peer addresses from the CGNAT range, 100.64.0.0/10.
@@ -158,8 +159,11 @@ local function install()
     local orig_connect = methods.connect
     methods.connect = function(sock, host, port, ...)
         -- Both cases fail closed: if NetBird can't help, the connection fails
-        -- rather than going out over the regular network.
-        if type(host) == "string" and NetBirdConnect.hostnames[host:lower()] then
+        -- rather than going out over the regular network. A listed name only while
+        -- a daemon runs, though: with NetBird off, the regular network is the way
+        -- there, as at home, whatever state an earlier start left behind.
+        if type(host) == "string" and NetBirdConnect.hostnames[host:lower()]
+                and NetBirdConnect.is_running() then
             local ip, err = resolve(host:lower())
             if not ip then
                 sock:close()
