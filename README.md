@@ -191,7 +191,7 @@ On the device, `<KOReader data dir>/netbird/` holds the binary, state and
 test/run.sh
 ```
 
-Needs Docker on an arm64 machine. It starts a real NetBird server and a real peer,
+Needs Docker on an arm64 machine. CI runs it on every pull request on GitHub's arm64 runners. It starts a real NetBird server and a real peer,
 then runs the real plugin and binary with stubbed KOReader widgets on two simulated
 e-readers: arm64 with TUN on a FAT data dir, and 32-bit ARM without TUN. Each runs
 through installing, tampered downloads, bad keys, connecting, HTTP and HTTPS to the
