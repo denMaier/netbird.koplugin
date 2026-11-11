@@ -1,0 +1,185 @@
+#!/usr/bin/python3
+"""Stand-in for the netbird binary, for the x86 KOReader emulator.
+
+Speaks the part of the CLI that netbird.sh uses, with a daemon on a unix socket like
+the real one. Run as `netbird`, so /proc/<pid>/comm matches what netbird.sh checks.
+
+  version
+  service run --daemon-addr unix://SOCK --config CFG --log-file LOG
+  --daemon-addr unix://SOCK up|down|status --json [...]
+
+The phone's approval of an SSO sign-in is a file named `approved` next to CFG.
+A setup key containing "bad" is refused. Without root, TUN mode fails the way the
+real client does without CAP_NET_ADMIN.
+"""
+import json
+import os
+import socket
+import sys
+import threading
+import time
+
+VERSION = "0.82.0"
+
+
+def arg(args, name, default=None):
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return default
+
+
+class Daemon:
+    def __init__(self, sock, config, log):
+        self.sock, self.config, self.logpath = sock, config, log
+        self.dir = os.path.dirname(config)
+        self.netstack = os.environ.get("NB_USE_NETSTACK_MODE") == "true"
+        self.lock = threading.Lock()
+        self.state = "Idle" if self.saved() else "NeedsLogin"
+        if self.saved():
+            # The real daemon reconnects by itself from its saved config.
+            threading.Timer(0.5, self.autoconnect).start()
+
+    def log(self, text):
+        with open(self.logpath, "a") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + text + "\n")
+
+    def saved(self):
+        try:
+            with open(self.config) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def save(self, url):
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self.config, "w") as f:
+            json.dump({"management_url": url, "peer": "kobo"}, f)
+
+    def autoconnect(self):
+        with self.lock:
+            if self.state == "Idle" and self.tun_ok():
+                self.state = "Connected"
+                self.log("reconnected from saved config")
+
+    def tun_ok(self):
+        return self.netstack or os.geteuid() == 0
+
+    def status(self):
+        connected = self.state == "Connected"
+        return {
+            "daemonStatus": self.state,
+            "netbirdIp": "100.92.1.5/16" if connected else "",
+            "fqdn": "kobo.netbird.cloud" if connected else "",
+            "peers": {"connected": 1 if connected else 0, "total": 1},
+        }
+
+    def up(self, args, out):
+        url = arg(args, "--management-url")
+        saved = self.saved()
+        if saved and saved.get("management_url") != url:
+            saved = None
+        if not saved:
+            key_file = arg(args, "--setup-key-file")
+            if key_file:
+                with open(key_file) as f:
+                    key = f.read().strip()
+                if "bad" in key:
+                    out("Error: login failed: rpc error: code = PermissionDenied desc = invalid setup key")
+                    return 1
+            else:
+                with self.lock:
+                    self.state = "NeedsLogin"
+                out("Please do the SSO login in your browser.")
+                out("If your browser didn't open automatically, use this URL to log in:")
+                out("")
+                out("https://login.netbird.test/activate?user_code=WXYZ-2345")
+                out("")
+                approved = os.path.join(self.dir, "approved")
+                deadline = time.time() + 300
+                while not os.path.exists(approved):
+                    if time.time() > deadline:
+                        out("Error: login failed: context deadline exceeded")
+                        return 1
+                    time.sleep(0.2)
+                os.remove(approved)
+            self.save(url)
+        if not self.tun_ok():
+            out("Error: up failed: create wg interface: error creating tun device wt0: operation not permitted")
+            with self.lock:
+                self.state = "Idle"
+            return 1
+        with self.lock:
+            self.state = "Connected"
+        self.log("connected" + (" (netstack)" if self.netstack else " (tun)"))
+        out("Connected")
+        return 0
+
+    def handle(self, conn):
+        with conn, conn.makefile("rw") as f:
+            request = json.loads(f.readline())
+
+            def out(line):
+                f.write(json.dumps({"out": line}) + "\n")
+                f.flush()
+
+            cmd, args = request["cmd"], request["args"]
+            code = 0
+            if cmd == "status":
+                out(json.dumps(self.status()))
+            elif cmd == "down":
+                with self.lock:
+                    if self.state == "Connected":
+                        self.state = "Idle"
+            elif cmd == "up":
+                code = self.up(args, out)
+            f.write(json.dumps({"exit": code}) + "\n")
+
+    def serve(self):
+        self.log("daemon started, " + ("netstack" if self.netstack else "tun") + " mode")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(self.sock)
+        server.listen(8)
+        while True:
+            conn, _ = server.accept()
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+
+def client(sock, cmd, args):
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.connect(sock)
+    except OSError as exc:
+        print(f"Error: failed to connect to daemon: {exc}", file=sys.stderr)
+        return 1
+    with conn, conn.makefile("rw") as f:
+        f.write(json.dumps({"cmd": cmd, "args": args}) + "\n")
+        f.flush()
+        for line in f:
+            message = json.loads(line)
+            if "exit" in message:
+                return message["exit"]
+            print(message["out"], flush=True)
+    return 1
+
+
+def main(argv):
+    if argv[:1] == ["version"]:
+        print(VERSION)
+        return 0
+    sock = arg(argv, "--daemon-addr", "unix:///var/run/netbird.sock").removeprefix("unix://")
+    rest = [a for i, a in enumerate(argv)
+            if a != "--daemon-addr" and (i == 0 or argv[i - 1] != "--daemon-addr")]
+    if rest[:2] == ["service", "run"]:
+        Daemon(sock, arg(rest, "--config"), arg(rest, "--log-file")).serve()
+        return 0
+    if rest and rest[0] in ("up", "down", "status"):
+        return client(sock, rest[0], rest[1:])
+    print(f"fake netbird: unsupported command {argv}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

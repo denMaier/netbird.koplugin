@@ -51,6 +51,9 @@ package.preload["datastorage"] = function()
     }
 end
 package.preload["device"] = function() return {} end
+-- KOReader's own dir. The CA bundle isn't there in this container, so netbird.sh
+-- falls back to the other places it looks.
+package.preload["libs/libkoreader-lfs"] = function() return { currentdir = function() return "/" end } end
 package.preload["dispatcher"] = function() return { registerAction = function() end } end
 package.preload["ui/uimanager"] = function() return UIManager end
 package.preload["ui/widget/infomessage"] = function() return widgetClass() end
@@ -92,7 +95,7 @@ end
 
 local function newPlugin()
     local p = NetBirdPlugin:new()
-    -- main.lua finds itself through debug.getinfo; dofile gives it this path.
+    -- No loader sets p.path here, so main.lua finds itself through debug.getinfo.
     p:init()
     return p
 end
