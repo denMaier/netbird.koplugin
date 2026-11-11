@@ -42,7 +42,8 @@ isn't made or endorsed by Tailscale.
 ## Install
 
 Needs a 32-bit or 64-bit ARM device, and about 60 MB of free space while installing
-(40 MB after).
+(40 MB after). Updating NetBird needs about 100 MB, because the old version stays until
+the new one is ready.
 
 1. Download `netbird.koplugin-<version>.zip` from
    [Releases](https://github.com/denMaier/netbird.koplugin/releases) and unzip it
@@ -118,7 +119,8 @@ device out, because a different server means a new peer.
 The top row of the menu shows the connection, and tapping it does what it says: connect,
 disconnect or sign in. You can also assign it to a gesture ("Toggle NetBird VPN").
 KOReader remembers your choice: connected stays connected across restarts, off stays off
-with no daemon running.
+with no daemon running. NetBird only runs while KOReader does. Leaving KOReader stops it,
+and it comes back the next time you open KOReader.
 
 Check the Status screen if something doesn't work. Every setup step is also available
 on its own under Advanced, along with updating and uninstalling.
@@ -139,14 +141,17 @@ The plugin picks one when NetBird starts.
 | Other programs to peers  | Yes                           | Only if they speak SOCKS5      |
 | Peers to the device      | Yes, if your policies allow   | No                             |
 
-Many jailbroken Kindles have no TUN device. If TUN is unstable on yours, turn on
-Advanced → Force userspace mode.
+TUN mode needs a working TUN driver and root, which KOReader usually has on a
+jailbroken device. Many jailbroken Kindles have no TUN driver. If NetBird can't create its
+TUN interface anyway, it switches to userspace mode by itself until KOReader restarts. If
+TUN is unstable on your device, turn on Advanced → Force userspace mode.
 
 In userspace mode NetBird only offers a SOCKS5 proxy on `127.0.0.1:1080`, and
 KOReader can't use SOCKS5. So `netbird_connect.lua` patches LuaSocket's `connect()` to
 send connections to `100.64.0.0/10` through that proxy. Everything else, including
-regular internet traffic, goes the normal way. If NetBird is down, those connections
-fail. They never fall back to the regular network.
+regular internet traffic, goes the normal way. While NetBird is on, or if it stops
+unexpectedly, those connections fail rather than go out over the regular network. Once
+you turn NetBird off, KOReader connects to those addresses the normal way again.
 
 ## What it doesn't do
 
@@ -169,9 +174,10 @@ fail. They never fall back to the regular network.
   `<KOReader data dir>/netbird/state/`. That is usually a FAT partition with no file
   permissions, readable by anyone who can mount the e-reader over USB. If you lose the
   device, delete the peer from your dashboard.
-- **USB storage mode** stops NetBird first and brings it back afterwards.
-- **Uninstalling** from Advanced removes the binary and the identity, not the
-  peer on your dashboard.
+- **USB storage mode** stops NetBird first and brings it back afterwards. So does
+  leaving KOReader for the stock reader.
+- **Uninstalling** from Advanced asks first, then removes the binary and the identity,
+  not the peer on your dashboard.
 
 ## Files
 
@@ -197,7 +203,21 @@ e-readers: arm64 with TUN on a FAT data dir, and 32-bit ARM without TUN. Each ru
 through installing, tampered downloads, bad keys, connecting, HTTP and HTTPS to the
 peer, reboots, USB storage mode, sign-in and uninstalling.
 
-It doesn't cover real e-reader kernels or KOReader's actual UI.
+It doesn't cover real e-reader kernels or KOReader's actual UI. For the UI, see below.
+
+### In the KOReader emulator
+
+```sh
+test/emulator/run.sh /path/to/koreader-dev
+```
+
+Runs the plugin inside KOReader's real desktop emulator at a Kobo Clara's size, with a
+stand-in for the NetBird binary, since the emulator runs on x86. It goes through setup,
+signing in with a QR code and with a key, a sign-in carried from the file browser into a
+book, falling back from a broken TUN device, the menus, uninstalling, a restart and
+quitting, and saves a screenshot of each screen. It needs an extracted KOReader AppImage, Xvfb and
+`proot`; see the script for the layout it expects. It doesn't test NetBird itself, which
+`test/run.sh` does.
 
 ## License
 

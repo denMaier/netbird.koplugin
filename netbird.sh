@@ -19,14 +19,26 @@ nb() {
 }
 
 # By pid rather than pgrep or killall, whose name matching differs across the
-# BusyBox builds on these devices. The check against comm covers a reused pid.
-daemon_pid() {
-    pid=$(cat "$RUN_DIR/daemon.pid" 2>/dev/null)
+# BusyBox builds on these devices. The check against comm covers a reused pid:
+# a pid file can outlive its process, and that pid can go to anything.
+alive() {
+    pid=$(cat "$RUN_DIR/$1" 2>/dev/null)
     [ -n "$pid" ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "netbird" ] && echo "$pid"
+}
+
+daemon_pid() {
+    alive daemon.pid
 }
 
 is_running() {
     [ -n "$(daemon_pid)" ]
+}
+
+# Alive and not a zombie, whatever its name. A child that died stays a zombie until
+# this script exits, and kill -0 still succeeds on one.
+exists() {
+    state=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -c1)
+    [ -n "$state" ] && [ "$state" != Z ]
 }
 
 ensure_loopback() {
@@ -57,6 +69,7 @@ export_ca_bundle() {
 }
 
 cmd_install() {
+    export_ca_bundle
     if [ "$("$BIN" version 2>/dev/null)" = "$VERSION" ]; then
         echo OK
         return 0
@@ -72,7 +85,9 @@ cmd_install() {
     archive="$HOME_DIR/netbird.tar.gz"
     url="https://github.com/netbirdio/netbird/releases/download/v$VERSION/netbird_${VERSION}_linux_$arch.tar.gz"
     rm -f "$archive"
-    wget -q -O "$archive" "$url" 2>/dev/null || curl -fsSL -o "$archive" "$url" 2>/dev/null
+    # Neither may know a CA store of its own. curl can be pointed at KOReader's.
+    wget -q -O "$archive" "$url" 2>/dev/null ||
+        curl -fsSL ${SSL_CERT_FILE:+--cacert "$SSL_CERT_FILE"} -o "$archive" "$url" 2>/dev/null
     if [ ! -s "$archive" ]; then
         rm -f "$archive"
         echo "Download failed"
@@ -125,12 +140,19 @@ cmd_start() {
         --config "$HOME_DIR/state/config.json" \
         --log-file "$HOME_DIR/netbird.log" \
         </dev/null >/dev/null 2>&1 &
-    echo $! > "$RUN_DIR/daemon.pid"
+    pid=$!
+    echo "$pid" > "$RUN_DIR/daemon.pid"
 
+    # A daemon that exits right away won't make a socket, so don't wait for one.
+    # By existence, not comm: until the fork has exec'd, comm still says sh.
     i=0
     while [ ! -S "$SOCK" ]; do
         i=$((i+1))
-        [ "$i" -ge 15 ] && return 1
+        if [ "$i" -ge 15 ] || ! exists "$pid"; then
+            kill "$pid" 2>/dev/null
+            rm -f "$RUN_DIR/mode" "$RUN_DIR/daemon.pid"
+            return 1
+        fi
         sleep 1
     done
 }
@@ -138,14 +160,15 @@ cmd_start() {
 # Only one sign-in at a time. It must be gone before up.log is reused, because a
 # killed `netbird up` still writes its "context canceled" error on the way out.
 stop_up() {
-    pid=$(cat "$RUN_DIR/up.pid" 2>/dev/null)
-    [ -n "$pid" ] || return 0
-    kill "$pid" 2>/dev/null
-    i=0
-    while [ -d "/proc/$pid" ] && [ "$i" -lt 5 ]; do
-        i=$((i+1))
-        sleep 1
-    done
+    pid=$(alive up.pid)
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null
+        i=0
+        while [ -d "/proc/$pid" ] && [ "$i" -lt 5 ]; do
+            i=$((i+1))
+            sleep 1
+        done
+    fi
     rm -f "$RUN_DIR/up.pid"
 }
 
@@ -168,7 +191,9 @@ cmd_up() {
     # --network-monitor: Wi-Fi comes and goes on an e-reader like it does on a
     # laptop, where NetBird turns this on by default.
     # Backgrounded because SSO blocks until the user signs in; main.lua polls.
-    nb up --no-browser --network-monitor=true \
+    # The binary itself, not through nb: a backgrounded function runs in a subshell,
+    # and $! would then be that shell, which stop_up can't stop the sign-in through.
+    "$BIN" --daemon-addr "unix://$SOCK" up --no-browser --network-monitor=true \
         --management-url "$NB_MANAGEMENT_URL" "$@" \
         </dev/null >"$RUN_DIR/up.log" 2>&1 &
     echo $! > "$RUN_DIR/up.pid"
@@ -176,8 +201,11 @@ cmd_up() {
 
 cmd_stop() {
     stop_up
-    [ -x "$BIN" ] && nb down >/dev/null 2>&1
-    kill "$(daemon_pid)" 2>/dev/null
+    # Starting the 40 MB binary only to find no daemon would delay a USB unmount.
+    if is_running; then
+        nb down >/dev/null 2>&1
+        kill "$(daemon_pid)" 2>/dev/null
+    fi
 
     # kill returns before the daemon exits, and it must be gone before KOReader
     # unmounts the partition it runs from for USB storage mode.
@@ -188,14 +216,14 @@ cmd_stop() {
         [ "$i" -ge 20 ] && break
         sleep 1
     done
-    rm -f "$SOCK" "$RUN_DIR/mode" "$RUN_DIR/up.log" "$RUN_DIR/daemon.pid"
+    rm -f "$SOCK" "$RUN_DIR/mode" "$RUN_DIR/up.log" "$RUN_DIR/daemon.pid" "$RUN_DIR/up.pid"
 }
 
 case "$1" in
     install) cmd_install ;;
     start) cmd_start ;;
     up) cmd_up ;;
-    down) nb down >/dev/null 2>&1; true ;;
+    down) is_running && nb down >/dev/null 2>&1; true ;;
     status) nb status --json 2>/dev/null ;;
     stop) cmd_stop ;;
     forget) cmd_stop; rm -rf "$HOME_DIR/state" ;;

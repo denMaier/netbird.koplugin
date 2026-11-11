@@ -1,11 +1,11 @@
 local DataStorage = require("datastorage")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
-local Device = require("device")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local LuaSettings = require("luasettings")
+local lfs = require("libs/libkoreader-lfs")
 local NetBirdConnect = require("netbird_connect")
 -- The plugin's dir is only on package.path while it loads, so this can't wait. A
 -- build without the QR widgets still works: it shows the URL as text instead.
@@ -36,6 +36,16 @@ local LOGIN_POLL_TIMEOUT = 300
 -- subprocess on a slow CPU. Cache briefly; any action invalidates it.
 local STATE_CACHE_TTL = 2
 
+-- KOReader's exit code for a restart in place (KO_RC_RESTART). Every other way out
+-- leaves KOReader, and the daemon must not outlive it.
+local KO_RC_RESTART = 85
+
+-- How long autoStart keeps checking for the daemon it started in the background.
+local AUTOSTART_WATCH_TIMEOUT = 30
+
+-- linux/capability.h
+local CAP_NET_ADMIN = 12
+
 local function shellQuote(value)
     return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
 end
@@ -52,9 +62,14 @@ end
 -- ─── setup ────────────────────────────────────────────────────────
 
 function NetBirdPlugin:init()
-    self.plugin_dir = debug.getinfo(1, "S").source:gsub("^@", ""):gsub("/main%.lua$", "")
+    -- The loader sets self.path, relative to KOReader's own dir when the plugin is
+    -- a built-in one. Plugins can also live in the data dir, which isn't always
+    -- the same place, so don't assume either.
+    self.koreader_dir = lfs.currentdir()
+    self.plugin_dir = self.path
+        or debug.getinfo(1, "S").source:gsub("^@", ""):gsub("/main%.lua$", "")
     if self.plugin_dir:sub(1, 1) ~= "/" then
-        self.plugin_dir = DataStorage:getFullDataDir() .. "/" .. self.plugin_dir
+        self.plugin_dir = self.koreader_dir .. "/" .. self.plugin_dir
     end
     -- Outside the plugin dir, so updating the plugin keeps the device's identity.
     self.home_dir = DataStorage:getFullDataDir() .. "/netbird"
@@ -67,27 +82,35 @@ function NetBirdPlugin:init()
     Dispatcher:registerAction("toggle_netbird_vpn",
         { category = "none", event = "ToggleNetBird", title = _("Toggle NetBird VPN"), general = true })
 
-    self:installUSBMSHook()
+    self:installQuitHook()
     self:autoStart()
+    self:resumeSignIn()
 end
 
---- Stop NetBird before KOReader enters USB storage mode. KOReader signals that by
--- calling UIManager:quit(86) (KO_RC_USBMS), and the daemon runs from the partition
--- being exported, so it would keep the filesystem busy. KOReader restarts cold
--- afterwards and autoStart brings the daemon back. UIManager is a singleton and the
--- plugin is instantiated for both ReaderUI and FileManager, so wrap it only once.
-function NetBirdPlugin:installUSBMSHook()
-    if UIManager._netbird_usbms_hook then
+--- Stop NetBird whenever KOReader exits, except to restart in place. The daemon
+-- runs from the data partition, so left running it would keep that busy: for USB
+-- storage mode (86), or for the stock reader's own USB mode after exiting (0, 87),
+-- and it would keep its memory for no one. want_connected is untouched, so the
+-- next start brings it back. A restart (85) keeps it, and autoStart adopts it.
+-- UIManager is a singleton and the plugin is instantiated for both ReaderUI and
+-- FileManager, so wrap it only once.
+function NetBirdPlugin:installQuitHook()
+    if UIManager._netbird_quit_hook then
         return
     end
-    UIManager._netbird_usbms_hook = true
+    UIManager._netbird_quit_hook = true
 
     local stop_command = self:scriptCommand("stop")
     local orig_quit = UIManager.quit
     UIManager.quit = function(uimgr, exit_code, ...)
-        if exit_code == 86 then -- KO_RC_USBMS
-            logger.info("NetBird: stopping the daemon before USB storage mode")
-            os.execute(stop_command) -- synchronous, it must be gone before the unmount
+        -- KOReader calls quit again on the way out without a code, which keeps the
+        -- one set before, as quit itself does.
+        local code = exit_code or uimgr._exit_code or 0
+        if code ~= KO_RC_RESTART and not UIManager._netbird_stopped_on_quit
+                and NetBirdPlugin.isRunning() then
+            UIManager._netbird_stopped_on_quit = true
+            logger.info("NetBird: stopping the daemon, KOReader exits with", code)
+            os.execute(stop_command) -- synchronous, it must be gone before an unmount
         end
         return orig_quit(uimgr, exit_code, ...)
     end
@@ -108,9 +131,35 @@ function NetBirdPlugin:autoStart()
     UIManager._netbird_autostart_done = true
     self:applyConnectMode(self:desiredMode())
     -- In the background, so that startup does not wait for the daemon's socket.
+    -- Once it is up, follow the mode it really runs in.
     UIManager:scheduleIn(3, function()
         os.execute(self:scriptCommand("start") .. " >/dev/null 2>&1 &")
+        local deadline = os.time() + AUTOSTART_WATCH_TIMEOUT
+        local function watch()
+            if self:isRunning() and self:runningMode() then
+                self:applyConnectMode(self:runningMode())
+            elseif os.time() < deadline then
+                UIManager:scheduleIn(2, watch)
+            end
+        end
+        UIManager:scheduleIn(2, watch)
     end)
+end
+
+--- The plugin is created anew when KOReader switches between the file browser and
+-- a book. A sign-in still waiting for the phone carries on in the new one.
+function NetBirdPlugin:resumeSignIn()
+    if self:isRunning() and self:isSigningIn() then
+        logger.info("NetBird: resuming the sign-in in progress")
+        self:applyConnectMode(self:runningMode())
+        self:startLoginPolling()
+    end
+end
+
+--- The old instance's timers and screens go with it, so they don't act twice.
+function NetBirdPlugin:onCloseWidget()
+    self:stopLoginPolling()
+    self:closeSignInQR()
 end
 
 -- ─── paths and shell ──────────────────────────────────────────────
@@ -124,15 +173,14 @@ function NetBirdPlugin:getManagementUrl()
 end
 
 function NetBirdPlugin:scriptCommand(command)
-    -- Only start needs the mode, and probing for it costs a subprocess.
     local mode = command == "start" and (" NB_MODE=" .. shellQuote(self:desiredMode())) or ""
     -- DNS stays off unless a hostname needs it: with it on, NetBird rewrites
     -- resolv.conf wherever that is writable, and nobody else should carry that.
     local dns = next(self:getHostnames()) and " NB_USE_DNS=1" or ""
     return "NB_HOME=" .. shellQuote(self.home_dir)
         .. " NB_RUN=" .. shellQuote(RUN_DIR)
-        -- plugins/netbird.koplugin -> the KOReader root, which holds the CA bundle
-        .. " NB_KOREADER_DIR=" .. shellQuote(self.plugin_dir .. "/../..")
+        -- KOReader's own dir, which holds the CA bundle
+        .. " NB_KOREADER_DIR=" .. shellQuote(self.koreader_dir)
         .. " NB_MANAGEMENT_URL=" .. shellQuote(self:getManagementUrl())
         .. dns
         .. mode
@@ -169,25 +217,47 @@ function NetBirdPlugin:isInstalled()
     return true
 end
 
---- Same check as daemon_pid in netbird.sh, without paying for a subprocess.
-function NetBirdPlugin:isRunning()
-    local pid = readFile(RUN_DIR .. "/daemon.pid")
+--- Whether the process in a pid file is still ours: a pid can be reused. Same check
+-- as alive in netbird.sh, without paying for a subprocess.
+local function pidFileAlive(name)
+    local pid = readFile(RUN_DIR .. "/" .. name)
     pid = pid and pid:match("%d+")
     if not pid then return false end
     local comm = readFile("/proc/" .. pid .. "/comm")
     return comm ~= nil and comm:match("^netbird%s*$") ~= nil
 end
 
+-- Also called without an instance, from the quit hook.
+function NetBirdPlugin.isRunning()
+    return pidFileAlive("daemon.pid")
+end
+
+--- A `netbird up` still waiting for the user to approve this device.
+function NetBirdPlugin:isSigningIn()
+    return pidFileAlive("up.pid")
+end
+
+--- A TUN device needs the driver, which a device node alone doesn't prove, and
+-- CAP_NET_ADMIN to create the interface. Opening the node asks the driver, and
+-- creates nothing until an ioctl that we never send.
 function NetBirdPlugin:hasTunDevice()
-    local ok, _exit, code = os.execute("test -c /dev/net/tun && test -r /dev/net/tun && test -w /dev/net/tun")
-    return execSucceeded(ok, code)
+    local f = io.open("/dev/net/tun", "r+")
+    if not f then return false end
+    f:close()
+    local status = readFile("/proc/self/status") or ""
+    local caps = status:match("CapEff:%s*(%x+)")
+    if not caps then return false end
+    local low = tonumber(caps:sub(-4), 16)
+    return math.floor(low / 2 ^ CAP_NET_ADMIN) % 2 == 1
 end
 
 --- Prefer a real TUN device: everything on the device can then reach peers.
 -- Netstack works anywhere, but only KOReader's own connections get through, by way
--- of netbird_connect.lua.
+-- of netbird_connect.lua. A TUN interface that failed once falls back to netstack
+-- until KOReader restarts.
 function NetBirdPlugin:desiredMode()
-    if self.settings:isTrue("force_userspace") or not self:hasTunDevice() then
+    if self.settings:isTrue("force_userspace") or NetBirdPlugin._tun_failed
+            or not self:hasTunDevice() then
         return "netstack"
     end
     return "tun"
@@ -301,7 +371,10 @@ end
 
 -- ─── connect / disconnect ─────────────────────────────────────────
 
-function NetBirdPlugin:connect()
+--- after, if given, runs once this attempt connects, in place of the usual message.
+-- It belongs to this attempt only: a later connect, or this one failing, drops it.
+function NetBirdPlugin:connect(after)
+    self._after_connect = nil
     if not self:hasNetwork() then
         UIManager:show(InfoMessage:new{
             text = _("No network connectivity.\nEnable Wi-Fi before starting NetBird."),
@@ -323,8 +396,8 @@ function NetBirdPlugin:connect()
         self:runScript("stop")
     end
     local was_running = self:isRunning()
-    local mode = was_running and self:runningMode() or self:desiredMode()
     local ok = self:runScript("start")
+    local mode = self:runningMode()
     -- A daemon that just started is already reconnecting on its saved settings, and
     -- `up` would save new ones but answer "already connected" without applying them.
     -- Not in netstack mode: this early `down` leaves its SOCKS5 proxy answering
@@ -344,6 +417,7 @@ function NetBirdPlugin:connect()
         return
     end
     self:applyConnectMode(mode)
+    self._after_connect = after
     self:startLoginPolling()
 end
 
@@ -404,6 +478,16 @@ function NetBirdPlugin:startLoginPolling()
         if state == "Connected" then
             self:stopLoginPolling()
             self:onConnected()
+        elseif up_error and self:isTunFailure(up_error) then
+            -- The device node looked fine, but the interface can't be made. Keep the
+            -- user connected in netstack mode rather than fail.
+            logger.warn("NetBird: TUN failed, falling back to userspace mode:", up_error)
+            NetBirdPlugin._tun_failed = true
+            local after = self._after_connect
+            self:stopLoginPolling()
+            self:runScript("stop")
+            self:invalidateState()
+            self:connect(after)
         elseif up_error then
             self:stopLoginPolling()
             self:closeSignInQR()
@@ -431,6 +515,16 @@ function NetBirdPlugin:startLoginPolling()
     UIManager:scheduleIn(LOGIN_POLL_INTERVAL, self._poll_fn)
 end
 
+--- An error from creating the TUN interface, in TUN mode, the first time only.
+function NetBirdPlugin:isTunFailure(up_error)
+    if NetBirdPlugin._tun_failed or self:runningMode() ~= "tun" then
+        return false
+    end
+    local err = up_error:lower()
+    return err:find("tun", 1, true) ~= nil or err:find("wt0", 1, true) ~= nil
+        or err:find("interface", 1, true) ~= nil
+end
+
 function NetBirdPlugin:stopLoginPolling()
     self:closeWaitMessage()
     if self._poll_fn then
@@ -440,9 +534,9 @@ function NetBirdPlugin:stopLoginPolling()
 end
 
 --- A leftover setup key would be used instead of showing the code the user asked for.
-function NetBirdPlugin:startQRLogin()
+function NetBirdPlugin:startQRLogin(after)
     os.remove(self:getSetupKeyPath())
-    self:connect()
+    self:connect(after)
 end
 
 function NetBirdPlugin:onConnected()
@@ -500,7 +594,7 @@ end
 
 function NetBirdPlugin:installNetBird(after)
     local msg = InfoMessage:new{
-        text = _("Downloading NetBird (15 MB, 40 MB once unpacked).\nThis may take a few minutes on slow Wi-Fi.\nDO NOT CLOSE KOReader."),
+        text = _("Downloading NetBird (15 MB, 40 MB once unpacked).\nThis may take a few minutes on slow Wi-Fi.\nAn update needs about 100 MB free.\nDO NOT CLOSE KOReader."),
     }
     UIManager:show(msg)
     UIManager:forceRePaint()
@@ -534,6 +628,15 @@ function NetBirdPlugin:installNetBird(after)
             timeout = 8,
         })
     end
+end
+
+--- It deletes this device's identity, which no update can bring back. Ask first.
+function NetBirdPlugin:confirmUninstall()
+    UIManager:show(ConfirmBox:new{
+        text = _("Uninstall NetBird?\n\nThis removes NetBird and this device's identity. To use NetBird again, you will need to sign in again."),
+        ok_text = _("Uninstall"),
+        ok_callback = function() self:uninstallNetBird() end,
+    })
 end
 
 function NetBirdPlugin:uninstallNetBird()
@@ -613,7 +716,7 @@ function NetBirdPlugin:askText(title, input, hint, description, on_save)
     dialog:onShowKeyboard()
 end
 
-function NetBirdPlugin:configureSetupKey()
+function NetBirdPlugin:configureSetupKey(after)
     self:askText(_("Setup key"), "", "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
         _("From Setup Keys in your NetBird dashboard. It is deleted from the device once connected."),
         function(key)
@@ -629,7 +732,7 @@ function NetBirdPlugin:configureSetupKey()
             end
             f:write(key .. "\n")
             f:close()
-            self:connect()
+            self:connect(after)
         end)
 end
 
@@ -663,14 +766,14 @@ end
 
 --- A daemon has to restart to turn DNS on or off, so reconnect right away instead
 -- of leaving the user to work out why the name doesn't resolve yet.
-function NetBirdPlugin:saveHostnames(value)
+function NetBirdPlugin:saveHostnames(value, after)
     self.settings:saveSetting("hostnames", value ~= "" and value or nil)
     self.settings:flush()
     if self:isRunning() then
         self:stopLoginPolling()
         self:runScript("stop")
         self:invalidateState()
-        self:connect()
+        self:connect(after)
     end
 end
 
@@ -731,8 +834,7 @@ function NetBirdPlugin:setupAskHostname()
                 self:setupSignIn()
             elseif self:isRunning() then
                 -- Already signed in: saving reconnects, and that finishes the setup.
-                self._after_connect = function() self:setupFinish() end
-                self:saveHostnames(value)
+                self:saveHostnames(value, function() self:setupFinish() end)
             else
                 self:saveHostnames(value)
                 self:setupSignIn()
@@ -755,20 +857,12 @@ function NetBirdPlugin:setupSignIn()
             end,
         }}
     end
-    local function finishAfterConnecting()
-        self._after_connect = function() self:setupFinish() end
-    end
+    local function finish() self:setupFinish() end
     dialog = ButtonDialog:new{
         title = _("Sign in to NetBird"),
         buttons = {
-            choice(_("Scan QR code"), function()
-                finishAfterConnecting()
-                self:startQRLogin()
-            end),
-            choice(_("Use a setup key"), function()
-                finishAfterConnecting()
-                self:configureSetupKey()
-            end),
+            choice(_("Scan QR code"), function() self:startQRLogin(finish) end),
+            choice(_("Use a setup key"), function() self:configureSetupKey(finish) end),
             choice(_("Server") .. ": " .. self:getManagementUrl(), function()
                 self:configureManagementUrl(function() self:setupSignIn() end)
             end),
@@ -842,7 +936,7 @@ function NetBirdPlugin:addToMainMenu(menu_items)
                         end,
                     },
                     { text = _("Install/Update NetBird"), callback = function() self:installNetBird() end },
-                    { text = _("Uninstall NetBird"), callback = function() self:uninstallNetBird() end },
+                    { text = _("Uninstall NetBird"), callback = function() self:confirmUninstall() end },
                 },
             },
         },

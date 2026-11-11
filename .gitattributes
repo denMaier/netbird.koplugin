@@ -7,3 +7,4 @@ assets export-ignore
 test export-ignore
 manifest.json export-ignore
 versions.json export-ignore
+.luacheckrc export-ignore
