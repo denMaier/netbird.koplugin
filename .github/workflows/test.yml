@@ -1,0 +1,19 @@
+# Runs test/run.sh on a GitHub arm64 runner, so pull requests don't need a local OrbStack run.
+name: test
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # The runner's CPU has no 32-bit mode, so the arm/v7 reader needs QEMU.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - run: test/run.sh
