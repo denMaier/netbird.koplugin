@@ -17,3 +17,31 @@ jobs:
         with:
           platforms: arm
       - run: test/run.sh
+
+  # The plugin in KOReader's real desktop emulator, with a stand-in netbird binary.
+  emulator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      KOREADER: v2026.07.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -yq xvfb x11-xkb-utils xkb-data proot
+      # run.sh expects an extracted AppImage and a sysroot; the runner's own tools stand in for the sysroot.
+      - name: Prepare the emulator
+        run: |
+          dev=$RUNNER_TEMP/koreader-dev
+          mkdir -p "$dev/sysroot/usr/bin" "$dev/sysroot/usr/share/X11"
+          cd "$dev"
+          curl -fsSLo koreader.AppImage "https://github.com/koreader/koreader/releases/download/$KOREADER/koreader-$KOREADER-x86_64.AppImage"
+          chmod +x koreader.AppImage
+          ./koreader.AppImage --appimage-extract >/dev/null
+          ln -s /usr/bin/Xvfb /usr/bin/proot /usr/bin/xkbcomp sysroot/usr/bin/
+          ln -s /usr/share/X11/xkb sysroot/usr/share/X11/xkb
+      - run: test/emulator/run.sh "$RUNNER_TEMP/koreader-dev"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-screenshots
+          path: test/emulator/out/
+          if-no-files-found: ignore

@@ -217,7 +217,7 @@ signing in with a QR code and with a key, a sign-in carried from the file browse
 book, falling back from a broken TUN device, the menus, uninstalling, a restart and
 quitting, and saves a screenshot of each screen. It needs an extracted KOReader AppImage, Xvfb and
 `proot`; see the script for the layout it expects. It doesn't test NetBird itself, which
-`test/run.sh` does.
+`test/run.sh` does. CI runs it too and keeps the screenshots as a build artifact.
 
 ## License
 
