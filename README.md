@@ -123,6 +123,11 @@ KOReader remembers your choice: connected stays connected across restarts, off s
 with no daemon running. NetBird only runs while KOReader does. Leaving KOReader stops it,
 and it comes back the next time you open KOReader.
 
+NetBird sleeps with the device. When it wakes, NetBird gets about 15 seconds after Wi-Fi
+is back to reconnect by itself. If it hasn't reached NetBird's servers by then, the plugin
+restarts it, which takes a few seconds, rather than wait for it to retry on its own,
+which after a long sleep can take over a minute.
+
 Check the Status screen if something doesn't work. Every setup step is also available
 on its own under Advanced, along with updating and uninstalling.
 

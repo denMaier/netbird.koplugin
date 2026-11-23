@@ -43,6 +43,13 @@ local KO_RC_RESTART = 85
 -- How long autoStart keeps checking for the daemon it started in the background.
 local AUTOSTART_WATCH_TIMEOUT = 30
 
+-- After waking up: how long to wait for Wi-Fi, then how long the daemon gets to
+-- reconnect by itself before it is restarted. After a long sleep it can take over a
+-- minute to reach its signal server again, where a restart takes seconds.
+local RESUME_NETWORK_TIMEOUT = 120
+local RESUME_GRACE = 15
+local RESUME_POLL_INTERVAL = 5
+
 -- linux/capability.h
 local CAP_NET_ADMIN = 12
 
@@ -57,6 +64,10 @@ local function execSucceeded(ok, code)
         return code == 0
     end
     return ok == 0
+end
+
+local function needsSignIn(state)
+    return state == "NeedsLogin" or state == "LoginFailed" or state == "SessionExpired"
 end
 
 -- ─── setup ────────────────────────────────────────────────────────
@@ -118,7 +129,7 @@ end
 
 --- Bring the daemon back on launch if the user left NetBird connected. The daemon
 -- reconnects by itself from its saved config. Off stays off, and no daemon runs.
--- Not on suspend: the kernel freezes the daemon and it recovers on resume.
+-- Not on suspend: the kernel freezes the daemon, and onResume looks after it.
 function NetBirdPlugin:autoStart()
     if self:isRunning() then
         self:applyConnectMode(self:runningMode())
@@ -131,19 +142,93 @@ function NetBirdPlugin:autoStart()
     UIManager._netbird_autostart_done = true
     self:applyConnectMode(self:desiredMode())
     -- In the background, so that startup does not wait for the daemon's socket.
-    -- Once it is up, follow the mode it really runs in.
-    UIManager:scheduleIn(3, function()
-        os.execute(self:scriptCommand("start") .. " >/dev/null 2>&1 &")
-        local deadline = os.time() + AUTOSTART_WATCH_TIMEOUT
-        local function watch()
-            if self:isRunning() and self:runningMode() then
-                self:applyConnectMode(self:runningMode())
-            elseif os.time() < deadline then
-                UIManager:scheduleIn(2, watch)
-            end
+    UIManager:scheduleIn(3, function() self:startInBackground() end)
+end
+
+--- Start the daemon without waiting for it, after running `first` (another script
+-- command) if given. Once the new daemon is up, follow the mode it really runs in.
+function NetBirdPlugin:startInBackground(first)
+    local old_pid = NetBirdPlugin.daemonPid()
+    local start = self:scriptCommand("start")
+    if first then
+        start = "{ " .. self:scriptCommand(first) .. "; " .. start .. "; }"
+    end
+    os.execute(start .. " >/dev/null 2>&1 &")
+    local deadline = os.time() + AUTOSTART_WATCH_TIMEOUT
+    local function watch()
+        local pid = NetBirdPlugin.daemonPid()
+        if pid and pid ~= old_pid and self:runningMode() then
+            self:applyConnectMode(self:runningMode())
+        elseif os.time() < deadline then
+            UIManager:scheduleIn(2, watch)
         end
-        UIManager:scheduleIn(2, watch)
-    end)
+    end
+    UIManager:scheduleIn(2, watch)
+end
+
+-- ─── sleep ────────────────────────────────────────────────────────
+
+function NetBirdPlugin:onSuspend()
+    self:stopResumeCheck()
+end
+
+--- The daemon was frozen while the device slept, and its connections to the
+-- management and signal servers may not survive that. Give it a moment once Wi-Fi
+-- is back, then restart it if it still hasn't reached both: peers can't be found
+-- without the signal server. A daemon waiting for a sign-in is left alone.
+function NetBirdPlugin:onResume()
+    self:stopResumeCheck()
+    if not self.settings:isTrue("want_connected") or not self:isRunning() then
+        return
+    end
+    self:invalidateState()
+    local network_deadline = os.time() + RESUME_NETWORK_TIMEOUT
+    local grace_deadline
+    self._resume_fn = function()
+        -- Something else took over: a connect, a disconnect or a sign-in.
+        if self._poll_fn or not self.settings:isTrue("want_connected")
+                or not self:isRunning() then
+            self._resume_fn = nil
+            return
+        end
+        if not grace_deadline then
+            if self:hasNetwork() then
+                grace_deadline = os.time() + RESUME_GRACE
+            elseif os.time() >= network_deadline then
+                self._resume_fn = nil
+                return
+            end
+            UIManager:scheduleIn(RESUME_POLL_INTERVAL, self._resume_fn)
+            return
+        end
+        local status = self:getStatus()
+        if status and (needsSignIn(status.daemonStatus) or NetBirdPlugin.isLinked(status)) then
+            self._resume_fn = nil
+            return
+        end
+        if os.time() < grace_deadline then
+            UIManager:scheduleIn(RESUME_POLL_INTERVAL, self._resume_fn)
+            return
+        end
+        self._resume_fn = nil
+        logger.info("NetBird: not reconnected after resume, restarting the daemon")
+        self:invalidateState()
+        self:startInBackground("stop")
+    end
+    UIManager:scheduleIn(RESUME_POLL_INTERVAL, self._resume_fn)
+end
+
+function NetBirdPlugin:stopResumeCheck()
+    if self._resume_fn then
+        UIManager:unschedule(self._resume_fn)
+        self._resume_fn = nil
+    end
+end
+
+--- Connected, and in touch with both servers NetBird needs to find its peers.
+function NetBirdPlugin.isLinked(status)
+    local function up(server) return type(server) == "table" and server.connected == true end
+    return status.daemonStatus == "Connected" and up(status.management) and up(status.signal)
 end
 
 --- The plugin is created anew when KOReader switches between the file browser and
@@ -158,6 +243,7 @@ end
 
 --- The old instance's timers and screens go with it, so they don't act twice.
 function NetBirdPlugin:onCloseWidget()
+    self:stopResumeCheck()
     self:stopLoginPolling()
     self:closeSignInQR()
 end
@@ -217,24 +303,32 @@ function NetBirdPlugin:isInstalled()
     return true
 end
 
---- Whether the process in a pid file is still ours: a pid can be reused. Same check
--- as alive in netbird.sh, without paying for a subprocess.
+--- The pid in a pid file if that process is still ours, or nil: a pid can be reused.
+-- Same check as alive in netbird.sh, without paying for a subprocess.
 local function pidFileAlive(name)
     local pid = readFile(RUN_DIR .. "/" .. name)
     pid = pid and pid:match("%d+")
-    if not pid then return false end
+    if not pid then return nil end
     local comm = readFile("/proc/" .. pid .. "/comm")
-    return comm ~= nil and comm:match("^netbird%s*$") ~= nil
+    if comm ~= nil and comm:match("^netbird%s*$") ~= nil then
+        return pid
+    end
+    return nil
 end
 
 -- Also called without an instance, from the quit hook.
 function NetBirdPlugin.isRunning()
+    return pidFileAlive("daemon.pid") ~= nil
+end
+
+--- The running daemon's pid, or nil.
+function NetBirdPlugin.daemonPid()
     return pidFileAlive("daemon.pid")
 end
 
 --- A `netbird up` still waiting for the user to approve this device.
 function NetBirdPlugin:isSigningIn()
-    return pidFileAlive("up.pid")
+    return pidFileAlive("up.pid") ~= nil
 end
 
 --- A TUN device needs the driver, which a device node alone doesn't prove, and
@@ -325,10 +419,6 @@ end
 
 function NetBirdPlugin:invalidateState()
     self._state_cache = nil
-end
-
-local function needsSignIn(state)
-    return state == "NeedsLogin" or state == "LoginFailed" or state == "SessionExpired"
 end
 
 --- What the top row says. It reports the connection, not the process: a daemon
