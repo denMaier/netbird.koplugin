@@ -281,6 +281,42 @@ else
 end
 check("peer still reachable with DNS on", waitFor(60, function() return fetchPeer() end) ~= nil)
 
+-- Sleep: the kernel freezes the daemon. One that comes back in touch with its
+-- servers is left alone.
+local pid_before = NetBirdPlugin.daemonPid()
+plugin:onSuspend()
+os.execute("kill -STOP " .. pid_before .. "; sleep 5; kill -CONT " .. pid_before)
+plugin:onResume()
+pump(40)
+check("a daemon that recovers after sleep is left alone", NetBirdPlugin.daemonPid() == pid_before,
+    NetBirdPlugin.daemonPid())
+-- One still cut off from the signal server is restarted, as after a long sleep.
+local real_status = plugin.getStatus
+plugin.getStatus = function(p)
+    local s = real_status(p)
+    if s and s.signal then s.signal.connected = false end
+    return s
+end
+plugin:onSuspend()
+plugin:onResume()
+pump(40)
+plugin.getStatus = real_status
+local restarted = waitFor(60, function() return plugin:getDaemonStatus() == "Connected" end)
+check("a daemon cut off from signal after sleep is restarted",
+    NetBirdPlugin.daemonPid() ~= nil and NetBirdPlugin.daemonPid() ~= pid_before, NetBirdPlugin.daemonPid())
+check("connected again after the restart", restarted == true, plugin:getDaemonStatus())
+check("the hook follows the restarted daemon", Connect.socks_enabled == (MODE == "netstack"))
+body = waitFor(60, function() return fetchPeer() end)
+check("peer reachable after the restart", body and body:match("hello from the peer"), body)
+if MODE == "tun" then
+    body = waitFor(60, function() return fetchOpds("http") end)
+    check("listed name reachable after the restart", body == "hello from opds", body)
+end
+-- Suspending again before the check runs cancels it.
+plugin:onResume()
+plugin:onSuspend()
+check("suspending cancels the check after resume", #scheduled == 0)
+
 -- Plugin instantiated again (FileManager -> ReaderUI) while the daemon runs.
 UIManager._netbird_autostart_done = nil
 plugin = newPlugin()
