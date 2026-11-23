@@ -167,6 +167,12 @@ you turn NetBird off, KOReader connects to those addresses the normal way again.
 - Inbound connections in userspace mode, such as SSH or Syncthing to the device.
 - Android, or anything that isn't ARM.
 
+On a Kindle without a TUN driver, where other programs need your NetBird network too, or
+a server behind a routing peer must be reached by its real name, see
+[netbird-kindle](https://github.com/workshop144/netbird-kindle). It adds firewall
+redirects, a small forwarder and a hosts entry to the system, which this plugin
+deliberately doesn't.
+
 ## Good to know
 
 - **Memory:** the daemon is a large Go program. It used about 70 MB of RAM when
