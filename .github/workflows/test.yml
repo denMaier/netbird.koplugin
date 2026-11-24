@@ -46,7 +46,7 @@ jobs:
           test -x sysroot/usr/bin/Xvfb && test -x sysroot/usr/bin/xkbcomp && test -d sysroot/usr/share/X11/xkb/rules
       - run: test/emulator/run.sh "$RUNNER_TEMP/koreader-dev"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: emulator-screenshots
           path: test/emulator/out/
