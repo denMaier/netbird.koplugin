@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The runner's CPU has no 32-bit mode, so the arm/v7 reader needs QEMU.
       - uses: docker/setup-qemu-action@v3
         with:
@@ -26,7 +26,7 @@ jobs:
       PROOT: v5.4.1
       PROOT_SHA256: 19f44283f5c0e73091c60195f5fcd4f4c1165505e44410d434e2ab1b677c1a09
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # run.sh expects an extracted AppImage and a sysroot. The runner image already has
       # Xvfb and xkb, and proot comes as a static build from its GitHub release, so the
       # job doesn't depend on Ubuntu's mirrors, which have failed to resolve on runners.
