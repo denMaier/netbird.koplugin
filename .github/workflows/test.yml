@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # The runner's CPU has no 32-bit mode, so the arm/v7 reader needs QEMU.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         with:
           platforms: arm
       - run: test/run.sh
