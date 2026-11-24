@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # CI-only changes ship nothing, so "ci(deps)" makes no release.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope
