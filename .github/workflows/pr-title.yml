@@ -1,0 +1,21 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  conventional:
+    runs-on: ubuntu-latest
+    steps:
+      # Squash merges use the PR title as the commit subject, and
+      # release-please reads those subjects to pick the next version.
+      - run: |
+          if ! printf '%s' "$TITLE" | grep -qE '^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([A-Za-z0-9._/-]+\))?!?: .+'; then
+            echo "::error::PR title must follow Conventional Commits, e.g. 'fix: handle empty config' or 'feat!: drop scheduled self-update'"
+            exit 1
+          fi
+        env:
+          TITLE: ${{ github.event.pull_request.title }}

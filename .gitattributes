@@ -8,3 +8,7 @@ test export-ignore
 manifest.json export-ignore
 versions.json export-ignore
 .luacheckrc export-ignore
+release-please-config.json export-ignore
+.release-please-manifest.json export-ignore
+CHANGELOG.md export-ignore
+version.txt export-ignore
