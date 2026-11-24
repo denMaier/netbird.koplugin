@@ -5,6 +5,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # A week's minor and patch updates come as one PR (and at most one
+    # release); major updates stay separate and wait for review.
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
     commit-message:
       prefix: ci
       include: scope
