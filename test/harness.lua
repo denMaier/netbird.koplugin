@@ -278,6 +278,30 @@ if MODE == "tun" then
     check("system DNS is unchanged on a read-only /etc", resolvConf() == resolv_before)
 else
     check("a listed name fails cleanly in userspace mode", fetchOpds("http") == nil)
+    -- The same server as an IP resource, reached through the proxy by address.
+    local OPDS_IP = "172.30.99.10"
+    next_input = "opds.internal=" .. OPDS_IP .. ", 10.0.0.0/8x"
+    plugin:configureRoutedAddresses()
+    shown[#shown].buttons[1][2].callback()
+    check("an entry that isn't an address is refused", plugin.settings:readSetting("routed_addresses") == nil)
+    check("and asked for again, as typed", shown[#shown].class == InputDialog and shown[#shown].input == next_input,
+        shown[#shown].input)
+    next_input = "Opds.Internal=" .. OPDS_IP .. ", 172.30.99.0/24"
+    shown[#shown].buttons[1][2].callback()
+    body = waitFor(60, function() return fetchOpds("https") end)
+    check("a routed name reaches the proxy over HTTPS, with its real SNI", body == "hello from opds", body)
+    check("a routed name reaches the proxy over HTTP", fetchOpds("http") == "hello from opds")
+    local _, code = http.request("http://" .. OPDS_IP .. "/")
+    check("a routed range reaches the server by address", code == 421, code)
+    -- Docker routes between its networks, so reaching the server proves nothing on
+    -- its own. With the proxy gone, routed connections must fail, not go around it.
+    Connect.proxy_port = 1
+    local direct = http.request("http://" .. OPDS_IP .. "/")
+    local named = fetchOpds("http")
+    Connect.proxy_port = 1080
+    check("routed addresses and names only go through NetBird", direct == nil and named == nil, direct or named)
+    _, code = http.request("http://netbird-server:80/oauth2/.well-known/openid-configuration")
+    check("unlisted names still use the system's DNS", code == 200, code)
 end
 check("peer still reachable with DNS on", waitFor(60, function() return fetchPeer() end) ~= nil)
 
@@ -308,10 +332,8 @@ check("connected again after the restart", restarted == true, plugin:getDaemonSt
 check("the hook follows the restarted daemon", Connect.socks_enabled == (MODE == "netstack"))
 body = waitFor(60, function() return fetchPeer() end)
 check("peer reachable after the restart", body and body:match("hello from the peer"), body)
-if MODE == "tun" then
-    body = waitFor(60, function() return fetchOpds("http") end)
-    check("listed name reachable after the restart", body == "hello from opds", body)
-end
+body = waitFor(60, function() return fetchOpds("http") end)
+check("listed name reachable after the restart", body == "hello from opds", body)
 -- Suspending again before the check runs cancels it.
 plugin:onResume()
 plugin:onSuspend()
@@ -334,10 +356,8 @@ check("autostart reconnects after a hard kill", state == "Connected", plugin:get
 check("same identity after reboot", plugin:getStatus().netbirdIp == first_ip, plugin:getStatus().netbirdIp)
 body = waitFor(60, function() return fetchPeer() end)
 check("peer reachable after reboot", body and body:match("hello from the peer"), body)
-if MODE == "tun" then
-    body = waitFor(60, function() return fetchOpds("http") end)
-    check("listed name reachable after reboot", body == "hello from opds", body)
-end
+body = waitFor(60, function() return fetchOpds("http") end)
+check("listed name reachable after reboot", body == "hello from opds", body)
 
 -- USB storage mode.
 local exit = UIManager.quit(UIManager, 86)
@@ -355,6 +375,7 @@ check("disconnect stops the daemon", not plugin:isRunning())
 check("label says off", plugin:connectionLabel() == "Off", plugin:connectionLabel())
 check("disconnect persists", not plugin.settings:isTrue("want_connected"))
 check("socks hook off after disconnect", Connect.socks_enabled == false)
+check("routed addresses let go after disconnect", next(Connect.routes.names) == nil and #Connect.routes.ranges == 0)
 UIManager._netbird_autostart_done = nil
 plugin = newPlugin()
 check("off stays off on the next launch", #scheduled == 0 and not plugin:isRunning())

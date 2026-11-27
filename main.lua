@@ -367,6 +367,8 @@ end
 function NetBirdPlugin:applyConnectMode(mode)
     NetBirdConnect.socks_enabled = mode == "netstack"
     NetBirdConnect.hostnames = mode == "tun" and self:getHostnames() or {}
+    NetBirdConnect.routes = NetBirdConnect.parseRoutes(mode == "netstack"
+        and self.settings:readSetting("routed_addresses"))
     NetBirdConnect.dns_host = nil
     NetBirdConnect.is_running = NetBirdPlugin.isRunning
     NetBirdConnect.find_dns_host = function()
@@ -752,7 +754,7 @@ function NetBirdPlugin:showStatus()
         table.insert(lines, _("Off"))
     else
         table.insert(lines, _("Mode: ") .. (self:runningMode() == "netstack"
-            and _("userspace (KOReader only, IPs only)") or _("TUN")))
+            and _("userspace (KOReader only)") or _("TUN")))
         local status = self:getStatus()
         if status then
             table.insert(lines, _("State: ") .. tostring(status.daemonStatus))
@@ -874,6 +876,30 @@ function NetBirdPlugin:configureHostnames()
         function(value) self:saveHostnames(value) end)
 end
 
+--- Takes effect on the next connection, no restart needed: only the hook uses it.
+-- Anything that isn't an address is sent back to fix rather than dropped.
+function NetBirdPlugin:configureRoutedAddresses(input)
+    self:askText(_("Routed addresses"), input or self.settings:readSetting("routed_addresses") or "",
+        "192.168.1.0/24, nas.lan=192.168.1.20",
+        _("Addresses behind a NetBird routing peer, separated by commas: a range, an IP, or name=IP to use a server's name."),
+        function(value)
+            local _routes, bad = NetBirdConnect.parseRoutes(value)
+            if #bad > 0 then
+                UIManager:show(InfoMessage:new{
+                    text = _("Not saved. These aren't addresses:\n") .. table.concat(bad, "\n"),
+                    timeout = 4,
+                })
+                self:configureRoutedAddresses(value)
+                return
+            end
+            self.settings:saveSetting("routed_addresses", value ~= "" and value or nil)
+            self.settings:flush()
+            if self:isRunning() then
+                self:applyConnectMode(self:runningMode())
+            end
+        end)
+end
+
 function NetBirdPlugin:onFlushSettings()
     self.settings:flush()
 end
@@ -903,7 +929,7 @@ function NetBirdPlugin:setupExplainMode()
     UIManager:show(ConfirmBox:new{
         text = tun
             and _("This device runs NetBird in TUN mode.\n\nReach your OPDS server by name: in your NetBird dashboard, add it as a domain resource with a routing peer, and allow this device to reach it.\n\nIf the server is a NetBird peer itself, you can use its NetBird IP instead.")
-            or _("This device runs NetBird in userspace mode, which has no domain names.\n\nReach your OPDS server by IP: install NetBird on the server so it becomes a peer, and allow this device to reach it. Then use its NetBird IP in KOReader."),
+            or _("This device runs NetBird in userspace mode, which has no domain names.\n\nReach your OPDS server by IP: install NetBird on the server so it becomes a peer, and allow this device to reach it. Then use its NetBird IP in KOReader.\n\nIf the server is behind a routing peer instead, add its address under Advanced → Routed addresses."),
         ok_text = _("Continue"),
         ok_callback = function()
             if tun then
@@ -1014,6 +1040,14 @@ function NetBirdPlugin:addToMainMenu(menu_items)
                         end,
                         enabled_func = function() return self:desiredMode() == "tun" end,
                         callback = function() self:configureHostnames() end,
+                    },
+                    {
+                        text_func = function()
+                            local addresses = self.settings:readSetting("routed_addresses")
+                            return _("Routed addresses") .. ": " .. (addresses or _("none"))
+                        end,
+                        enabled_func = function() return self:desiredMode() == "netstack" end,
+                        callback = function() self:configureRoutedAddresses() end,
                     },
                     {
                         text = _("Force userspace mode"),

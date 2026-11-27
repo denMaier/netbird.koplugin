@@ -30,8 +30,9 @@ services:
     platform: linux/arm64
     command: ["sh", "/test/opds.sh"]
     configs: [{ source: opds_sh, target: /test/opds.sh }]
-    # default is only for installing nginx. The name exists on backend alone.
-    networks: { default: {}, backend: { aliases: [opds.internal] } }
+    # default is only for installing nginx. The name exists on backend alone, and
+    # the fixed address is published as an IP resource for userspace mode.
+    networks: { default: {}, backend: { aliases: [opds.internal], ipv4_address: 172.30.99.10 } }
 
   setup:
     image: alpine:3.20
@@ -64,6 +65,7 @@ networks:
   default:
   backend:
     internal: true
+    ipam: { config: [{ subnet: 172.30.99.0/24 }] }
 
 volumes:
   shared:
