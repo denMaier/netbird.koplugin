@@ -86,7 +86,8 @@ reverse proxy and its certificate. Every other name uses the device's normal DNS
 NetBird can't resolve a listed name while connected, the connection fails rather than
 going out over the regular network. With NetBird turned off, those names use the
 device's normal DNS again, so at home, where you can reach your server directly, just
-turn NetBird off. A redirect to another name needs that name listed too.
+turn NetBird off, or let [Connect automatically](#connecting-automatically) do it. A
+redirect to another name needs that name listed too.
 
 If your server is a NetBird peer itself, you can use its NetBird IP instead, as below.
 
@@ -135,6 +136,19 @@ DNS stays off until you list a name. With it on, NetBird tries to rewrite
 `/etc/resolv.conf`. On a Kindle the rootfs is read-only, so that fails harmlessly. Where
 it is writable, such as a Kobo, NetBird rewrites the file while connected and restores it
 when it stops, or at the next start after a crash.
+
+### Connecting automatically
+
+Under Connect automatically, turn on **Connect on untrusted Wi-Fi**, and while you are on
+your home network, tap **Trust this network**. From then on, joining a trusted network
+turns NetBird off, and joining any other network turns it on. That includes networks whose
+name KOReader can't read, which is every network on PocketBook. It also checks when the
+device wakes up, in case it woke up somewhere else, and when KOReader starts, in place of
+how you left it.
+
+Only joining a different network decides. If you connect or disconnect yourself, that holds
+until the device joins another network. Turning NetBird on this way needs a device that has
+already signed in.
 
 ## TUN and userspace mode
 

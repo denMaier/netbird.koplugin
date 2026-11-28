@@ -68,7 +68,14 @@ package.preload["ui/widget/confirmbox"] = function() return ConfirmBox end
 package.preload["ui/widget/buttondialog"] = function() return ButtonDialog end
 package.preload["netbird_qr"] = function() return QRMessage end
 package.preload["ui/widget/textviewer"] = function() return widgetClass() end
-package.preload["ui/network/manager"] = function() return { isConnected = function() return true end } end
+-- The Wi-Fi network the device is on, for on demand. nil is one with no name to read.
+local current_ssid
+package.preload["ui/network/manager"] = function()
+    return {
+        isConnected = function() return true end,
+        getCurrentNetwork = function() return current_ssid and { ssid = current_ssid } end,
+    }
+end
 package.preload["luasettings"] = function() return LuaSettings end
 package.preload["json"] = function() return { decode = cjson.decode } end
 package.preload["logger"] = function()
@@ -365,6 +372,45 @@ check("reconnects without a setup key", plugin:getDaemonStatus() == "Connected",
 check("still the same identity", plugin:getStatus().netbirdIp == first_ip, plugin:getStatus().netbirdIp)
 body = waitFor(60, function() return fetchPeer() end)
 check("peer reachable after reconnect", body and body:match("hello from the peer"), body)
+
+-- On demand: joining a trusted network disconnects, any other network connects.
+current_ssid = "Home"
+plugin:setTrusted("Home", true)
+plugin.settings:saveSetting("on_demand", true)
+plugin:reapplyOnDemand()
+check("on demand disconnects on a trusted network", not plugin:isRunning())
+check("and remembers it is off", not plugin.settings:isTrue("want_connected"))
+plugin:toggleConnection()
+pump(90)
+plugin:onNetworkConnected()
+check("connecting by hand holds on the same network",
+    plugin:isRunning() and plugin:getDaemonStatus() == "Connected", plugin:getDaemonStatus())
+plugin:disconnect()
+current_ssid = "Cafe"
+plugin:onNetworkConnected()
+pump(5)
+state = waitFor(90, function() return plugin:getDaemonStatus() == "Connected" and "Connected" end)
+check("on demand connects on an untrusted network", state == "Connected", plugin:getDaemonStatus())
+check("and remembers it is on", plugin.settings:isTrue("want_connected"))
+check("the hook follows the on-demand daemon", Connect.socks_enabled == (MODE == "netstack"))
+body = waitFor(60, function() return fetchPeer() end)
+check("peer reachable after connecting on demand", body and body:match("hello from the peer"), body)
+-- Waking up on a trusted network, which a Kindle joins without telling KOReader.
+current_ssid = "Home"
+plugin:onSuspend()
+plugin:onResume()
+pump(15)
+check("waking up on a trusted network disconnects", not plugin:isRunning())
+-- A network whose name can't be read isn't trusted.
+current_ssid = nil
+UIManager._netbird_autostart_done = nil
+plugin = newPlugin()
+check("on demand decides at launch", #scheduled == 1)
+pump(5)
+state = waitFor(90, function() return plugin:getDaemonStatus() == "Connected" and "Connected" end)
+check("on demand connects on a network with no name", state == "Connected", plugin:getDaemonStatus())
+plugin.settings:saveSetting("on_demand", nil)
+plugin.settings:saveSetting("trusted_networks", nil)
 
 -- A changed management server must really be used on the next connect, not just
 -- saved. An unreachable one is the easy way to see which server it talks to.

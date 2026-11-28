@@ -135,8 +135,16 @@ function NetBirdPlugin:autoStart()
         self:applyConnectMode(self:runningMode())
         return
     end
-    if UIManager._netbird_autostart_done or not self.settings:isTrue("want_connected")
-            or not self:isInstalled() then
+    if UIManager._netbird_autostart_done or not self:isInstalled() then
+        return
+    end
+    -- On demand, the network KOReader starts on decides, not how it was left.
+    if self.settings:isTrue("on_demand") and self:hasNetwork() then
+        UIManager._netbird_autostart_done = true
+        UIManager:scheduleIn(3, function() self:applyOnDemand() end)
+        return
+    end
+    if not self.settings:isTrue("want_connected") then
         return
     end
     UIManager._netbird_autostart_done = true
@@ -176,9 +184,14 @@ end
 -- management and signal servers may not survive that. Give it a moment once Wi-Fi
 -- is back, then restart it if it still hasn't reached both: peers can't be found
 -- without the signal server. A daemon waiting for a sign-in is left alone.
+-- On demand, the device may also wake up on another network. A Kindle rejoins it
+-- without telling KOReader, so this is where that is noticed.
 function NetBirdPlugin:onResume()
     self:stopResumeCheck()
-    if not self.settings:isTrue("want_connected") or not self:isRunning() then
+    local function stays_connected()
+        return self.settings:isTrue("want_connected") and self:isRunning()
+    end
+    if not stays_connected() and not self.settings:isTrue("on_demand") then
         return
     end
     self:invalidateState()
@@ -186,13 +199,16 @@ function NetBirdPlugin:onResume()
     local grace_deadline
     self._resume_fn = function()
         -- Something else took over: a connect, a disconnect or a sign-in.
-        if self._poll_fn or not self.settings:isTrue("want_connected")
-                or not self:isRunning() then
+        if self._poll_fn or (grace_deadline and not stays_connected()) then
             self._resume_fn = nil
             return
         end
         if not grace_deadline then
             if self:hasNetwork() then
+                if self:applyOnDemand() or not stays_connected() then
+                    self._resume_fn = nil
+                    return
+                end
                 grace_deadline = os.time() + RESUME_GRACE
             elseif os.time() >= network_deadline then
                 self._resume_fn = nil
@@ -512,7 +528,7 @@ function NetBirdPlugin:connect(after)
     self:startLoginPolling()
 end
 
-function NetBirdPlugin:disconnect()
+function NetBirdPlugin:disconnect(message)
     self:stopLoginPolling()
     self:closeSignInQR()
     self:runScript("stop")
@@ -521,7 +537,81 @@ function NetBirdPlugin:disconnect()
     self._after_connect = nil
     self.settings:saveSetting("want_connected", false)
     self.settings:flush()
-    UIManager:show(InfoMessage:new{ text = _("NetBird disconnected"), timeout = 2 })
+    UIManager:show(InfoMessage:new{ text = message or _("NetBird disconnected"), timeout = 2 })
+end
+
+-- ─── on demand ────────────────────────────────────────────────────
+
+--- The Wi-Fi network's name, or nil where KOReader can't tell, as on PocketBook.
+function NetBirdPlugin:currentNetwork()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if not ok or not NetworkMgr.getCurrentNetwork then return nil end
+    local got, network = pcall(NetworkMgr.getCurrentNetwork, NetworkMgr)
+    local ssid = got and type(network) == "table" and network.ssid
+    return type(ssid) == "string" and ssid ~= "" and ssid or nil
+end
+
+function NetBirdPlugin:getTrustedNetworks()
+    return self.settings:readSetting("trusted_networks") or {}
+end
+
+function NetBirdPlugin:isTrusted(ssid)
+    for _i, name in ipairs(self:getTrustedNetworks()) do
+        if name == ssid then return true end
+    end
+    return false
+end
+
+function NetBirdPlugin:setTrusted(ssid, trusted)
+    local list = {}
+    for _i, name in ipairs(self:getTrustedNetworks()) do
+        if name ~= ssid then table.insert(list, name) end
+    end
+    if trusted then table.insert(list, ssid) end
+    self.settings:saveSetting("trusted_networks", #list > 0 and list or nil)
+    self.settings:flush()
+end
+
+--- On demand, joining a network decides: off on a trusted one, on everywhere else,
+-- including on a network whose name can't be read. Only a change of network decides,
+-- so connecting or disconnecting by hand holds until the next one. Returns true when
+-- it started or stopped NetBird.
+function NetBirdPlugin:applyOnDemand()
+    if not self.settings:isTrue("on_demand") or not self:isInstalled() or not self:hasNetwork() then
+        return false
+    end
+    local ssid = self:currentNetwork()
+    -- Module-level, so a new instance (file browser to book) doesn't decide again.
+    if (ssid or "") == NetBirdPlugin._on_demand_network then
+        return false
+    end
+    NetBirdPlugin._on_demand_network = ssid or ""
+    if self:isTrusted(ssid) then
+        if not self:isRunning() then return false end
+        logger.info("NetBird: on a trusted network, disconnecting")
+        self:disconnect(_("Trusted network: NetBird disconnected"))
+        return true
+    end
+    if self:isRunning() then return false end
+    logger.info("NetBird: on an untrusted network, connecting")
+    self.settings:saveSetting("want_connected", true)
+    self.settings:flush()
+    self:invalidateState()
+    -- Like autoStart: the daemon reconnects by itself from its saved config.
+    self:applyConnectMode(self:desiredMode())
+    self:startInBackground()
+    UIManager:show(InfoMessage:new{ text = _("Untrusted network: NetBird connecting"), timeout = 2 })
+    return true
+end
+
+--- After a change to the rule itself, it applies right away to the current network.
+function NetBirdPlugin:reapplyOnDemand()
+    NetBirdPlugin._on_demand_network = nil
+    self:applyOnDemand()
+end
+
+function NetBirdPlugin:onNetworkConnected()
+    self:applyOnDemand()
 end
 
 -- ─── sign-in ──────────────────────────────────────────────────────
@@ -976,6 +1066,54 @@ end
 
 -- ─── menu ─────────────────────────────────────────────────────────
 
+--- Built each time it opens, so it offers whatever network the device is on. A
+-- network is trusted from the device while on it, which spares typing its name.
+function NetBirdPlugin:onDemandMenu(refresh)
+    local current = self:currentNetwork()
+    local function trustItem(ssid, label)
+        return {
+            text = label,
+            keep_menu_open = true,
+            checked_func = function() return self:isTrusted(ssid) end,
+            callback = function(touchmenu_instance)
+                self:setTrusted(ssid, not self:isTrusted(ssid))
+                if ssid == current then self:reapplyOnDemand() end
+                refresh(touchmenu_instance)
+            end,
+        }
+    end
+    local items = {
+        {
+            text = _("Connect on untrusted Wi-Fi"),
+            help_text = _("NetBird connects when the device joins a Wi-Fi network you haven't trusted, and disconnects on one you have. Connecting or disconnecting by hand still works until the next network."),
+            keep_menu_open = true,
+            separator = true,
+            checked_func = function() return self.settings:isTrue("on_demand") end,
+            callback = function(touchmenu_instance)
+                self.settings:flipNilOrFalse("on_demand")
+                self.settings:flush()
+                self:reapplyOnDemand()
+                refresh(touchmenu_instance)
+            end,
+        },
+    }
+    if current then
+        table.insert(items, trustItem(current, _("Trust this network: ") .. current))
+    else
+        table.insert(items, {
+            text = self:hasNetwork() and _("This network's name can't be read")
+                or _("Join a Wi-Fi network to trust it"),
+            enabled = false,
+        })
+    end
+    for _i, ssid in ipairs(self:getTrustedNetworks()) do
+        if ssid ~= current then
+            table.insert(items, trustItem(ssid, _("Trusted: ") .. ssid))
+        end
+    end
+    return items
+end
+
 function NetBirdPlugin:addToMainMenu(menu_items)
     local function refresh(touchmenu_instance)
         if touchmenu_instance and touchmenu_instance.updateItems then
@@ -996,6 +1134,10 @@ function NetBirdPlugin:addToMainMenu(menu_items)
             },
             { text = _("Set up NetBird"), callback = function() self:setupStart() end },
             { text = _("Status"), callback = function() self:showStatus() end },
+            {
+                text = _("Connect automatically"),
+                sub_item_table_func = function() return self:onDemandMenu(refresh) end,
+            },
             {
                 text = _("Advanced"),
                 sub_item_table = {
