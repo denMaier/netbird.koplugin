@@ -5,8 +5,10 @@
 -- caller still sees its original hostname, so a reverse proxy gets the right Host
 -- header and SNI. Anything else is left alone.
 --
--- Userspace mode: NetBird's peers are only reachable through a SOCKS5 proxy on
--- loopback, and KOReader can use an HTTP proxy but not SOCKS5.
+-- Userspace mode: NetBird's peers, and addresses behind its routing peers, are only
+-- reachable through a SOCKS5 proxy on loopback, and KOReader can use an HTTP proxy
+-- but not SOCKS5. The proxy only takes addresses, so a server behind a routing peer
+-- is reached by name through a fixed name=IP entry.
 --
 -- Listed hostnames: a NetBird domain resource only gets its route when NetBird's
 -- own DNS server answers for it. The system's DNS can't be relied on to ask it,
@@ -18,27 +20,70 @@ local NetBirdConnect = {
     proxy_host = "127.0.0.1",
     proxy_port = 1080, -- NetBird's default NB_SOCKS5_LISTENER_PORT
     hostnames = {}, -- set of lowercase names to resolve through NetBird
+    routes = { names = {}, ranges = {} }, -- userspace mode, from parseRoutes
     dns_timeout = 5,
     dns_host = nil, -- found once through find_dns_host, then kept
     find_dns_host = nil, -- set by main.lua; returns NetBird's DNS address, or nil
     is_running = function() return false end, -- set by main.lua; whether a daemon is up
 }
 
---- NetBird hands out peer addresses from the CGNAT range, 100.64.0.0/10.
--- Returns the four octets, or nil for anything else. Hostnames never match:
--- netstack mode has no DNS, so peers can only be reached by IP.
-local function parseNetBirdIP(host)
+--- An IPv4 address as a number, or nil for anything else, hostnames included.
+local function parseIPv4(host)
     if type(host) ~= "string" then return nil end
     local a, b, c, d = host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
     a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
-    if a == 100 and b >= 64 and b <= 127 and c <= 255 and d <= 255 then
-        return a, b, c, d
+    if not a or a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+    return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+local function range(ip, bits)
+    local size = 2 ^ (32 - bits)
+    return { ip = ip - ip % size, size = size }
+end
+
+local function inRange(ip, r)
+    return ip - ip % r.size == r.ip
+end
+
+-- NetBird hands out peer addresses from the CGNAT range.
+local NETBIRD_RANGE = range(parseIPv4("100.64.0.0"), 10)
+
+--- Routed addresses from a list separated by commas or spaces. Each entry is a
+-- range (192.168.1.0/24), an address, or name=address for a server reached by
+-- name. Returns the routes, and the entries that are none of these.
+function NetBirdConnect.parseRoutes(text)
+    local routes, bad = { names = {}, ranges = {} }, {}
+    for entry in (text or ""):gmatch("[^%s,]+") do
+        local name, address = entry:match("^([%w%.%-]+)=(.+)$")
+        local addr, bits = entry:match("^([%d%.]+)/(%d+)$")
+        if name and parseIPv4(address) then
+            routes.names[name:lower()] = parseIPv4(address)
+        elseif addr and parseIPv4(addr) and tonumber(bits) <= 32 then
+            table.insert(routes.ranges, range(parseIPv4(addr), tonumber(bits)))
+        elseif parseIPv4(entry) then
+            table.insert(routes.ranges, range(parseIPv4(entry), 32))
+        else
+            table.insert(bad, entry)
+        end
+    end
+    return routes, bad
+end
+
+--- The address to reach through the proxy, or nil to connect the regular way.
+local function proxiedAddress(host)
+    local named = NetBirdConnect.routes.names[host:lower()]
+    if named then return named end
+    local ip = parseIPv4(host)
+    if not ip then return nil end
+    if inRange(ip, NETBIRD_RANGE) then return ip end
+    for _, r in ipairs(NetBirdConnect.routes.ranges) do
+        if inRange(ip, r) then return ip end
     end
     return nil
 end
 
 --- RFC 1928 CONNECT, no authentication. The socket's timeout, if any, applies.
-local function handshake(sock, port, a, b, c, d)
+local function handshake(sock, port, ip)
     local ok, err = sock:send("\5\1\0")
     if not ok then return nil, err end
     local reply
@@ -46,7 +91,9 @@ local function handshake(sock, port, a, b, c, d)
     if not reply then return nil, err end
     if reply ~= "\5\0" then return nil, "SOCKS5 proxy refused the handshake" end
 
-    ok, err = sock:send(string.char(5, 1, 0, 1, a, b, c, d, math.floor(port / 256), port % 256))
+    ok, err = sock:send(string.char(5, 1, 0, 1,
+        math.floor(ip / 16777216), math.floor(ip / 65536) % 256, math.floor(ip / 256) % 256, ip % 256,
+        math.floor(port / 256), port % 256))
     if not ok then return nil, err end
     reply, err = sock:receive(4)
     if not reply then return nil, err end
@@ -172,16 +219,16 @@ local function install()
             return orig_connect(sock, ip, port, ...)
         end
 
-        local a, b, c, d
-        if NetBirdConnect.socks_enabled then
-            a, b, c, d = parseNetBirdIP(host)
+        local ip
+        if NetBirdConnect.socks_enabled and type(host) == "string" then
+            ip = proxiedAddress(host)
         end
-        if not a then
+        if not ip then
             return orig_connect(sock, host, port, ...)
         end
         local ok, err = orig_connect(sock, NetBirdConnect.proxy_host, NetBirdConnect.proxy_port)
         if ok then
-            ok, err = handshake(sock, tonumber(port), a, b, c, d)
+            ok, err = handshake(sock, tonumber(port), ip)
         end
         if not ok then
             sock:close()

@@ -96,13 +96,24 @@ may also work in TUN mode, but they haven't been tested.
 
 ### Userspace mode: reach your server by IP
 
-Domain names and domain resources don't work in this mode.
+NetBird's DNS and domain resources don't work in this mode.
 
 1. Install NetBird on your OPDS server, so that it is a peer itself.
 2. Add a policy that lets this device reach it.
 3. In KOReader, use the server's NetBird IP, such as `http://100.92.1.5:8080/opds`.
 
-A server behind a reverse proxy that needs its real name won't work this way.
+If your server is behind a routing peer instead, add its address in your NetBird
+dashboard as an **IP resource** (or a network route), allow this device to reach it, and
+list it under Advanced → Routed addresses, separated by commas:
+
+- `192.168.1.0/24` or `192.168.1.20`: KOReader reaches these addresses through NetBird.
+- `opds.example.com=192.168.1.20`: KOReader reaches that name at that address through
+  NetBird, and keeps the real name for your reverse proxy and its certificate. Use this
+  when the server needs its name, as most HTTPS servers do.
+
+The name is fixed to the address you give, because NetBird's DNS isn't reachable in this
+mode. So this doesn't work for a domain resource, whose route only appears once NetBird's
+DNS answers for it.
 
 ### Signing in
 
@@ -168,21 +179,21 @@ TUN is unstable on your device, turn on Advanced → Force userspace mode.
 
 In userspace mode NetBird only offers a SOCKS5 proxy on `127.0.0.1:1080`, and
 KOReader can't use SOCKS5. So `netbird_connect.lua` patches LuaSocket's `connect()` to
-send connections to `100.64.0.0/10` through that proxy. Everything else, including
-regular internet traffic, goes the normal way. While NetBird is on, or if it stops
-unexpectedly, those connections fail rather than go out over the regular network. Once
-you turn NetBird off, KOReader connects to those addresses the normal way again.
+send connections to `100.64.0.0/10` and to your routed addresses through that proxy.
+Everything else, including regular internet traffic, goes the normal way. While NetBird
+is on, or if it stops unexpectedly, those connections fail rather than go out over the
+regular network. Once you turn NetBird off, KOReader connects to those addresses the
+normal way again.
 
 ## What it doesn't do
 
-- Domain names in userspace mode, or for programs other than KOReader.
+- Looking up names in userspace mode, or for programs other than KOReader.
 - Exit nodes and picking routes. Manage those on your NetBird dashboard.
 - HTTP proxying for other programs.
 - Inbound connections in userspace mode, such as SSH or Syncthing to the device.
 - Android, or anything that isn't ARM.
 
-On a Kindle without a TUN driver, where other programs need your NetBird network too, or
-a server behind a routing peer must be reached by its real name, see
+On a Kindle without a TUN driver, where other programs need your NetBird network too, see
 [netbird-kindle](https://github.com/workshop144/netbird-kindle). It adds firewall
 redirects, a small forwarder and a hosts entry to the system, which this plugin
 deliberately doesn't.
