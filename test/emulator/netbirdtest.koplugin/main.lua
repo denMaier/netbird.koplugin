@@ -216,6 +216,24 @@ local function run()
     check("top row says connected", touchmenu.item_table[1].text_func() == "Connected",
         touchmenu.item_table[1].text_func())
     shoot("menu-connected")
+    -- The emulator has no Wi-Fi network name, so give it one.
+    local NetworkMgr = require("ui/network/manager")
+    local real_current = NetworkMgr.getCurrentNetwork
+    NetworkMgr.getCurrentNetwork = function() return { ssid = "Home Wi-Fi" } end
+    for _, entry in ipairs(touchmenu.item_table) do
+        if entry.text == "Connect automatically" then touchmenu:onMenuSelect(entry) end
+    end
+    sleep(0.5)
+    local trust = touchmenu.item_table[2]
+    check("on demand offers to trust this network", trust and trust.text == "Trust this network: Home Wi-Fi",
+        trust and trust.text)
+    touchmenu:onMenuSelect(touchmenu.item_table[1])
+    sleep(0.5)
+    check("on demand turns on", nb.settings:isTrue("on_demand"))
+    check("on demand leaves a connection on an untrusted network alone", nb:isRunning())
+    shoot("menu-on-demand")
+    touchmenu:onMenuSelect(touchmenu.item_table[1])
+    NetworkMgr.getCurrentNetwork = real_current
     closeMenu()
 
     nb:showStatus()
